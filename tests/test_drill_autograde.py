@@ -183,9 +183,10 @@ def test_middleware_order_request_id_outermost():
     structured-logging middle, metrics inner.
     """
     client = _get_client()
-    # Starlette stores user_middleware in the order add_middleware was called;
-    # the LAST add_middleware call is the OUTERMOST layer. So the outermost
-    # middleware is at the END of the user_middleware list.
+    # Starlette's add_middleware does user_middleware.insert(0, ...), so the
+    # LAST add_middleware call ends up at INDEX 0 of user_middleware — which
+    # is the OUTERMOST layer of the runtime stack. Read user_middleware as
+    # outermost -> innermost.
     from app import app as fastapi_app
 
     names = [m.cls.__name__ for m in fastapi_app.user_middleware]
@@ -193,9 +194,9 @@ def test_middleware_order_request_id_outermost():
         "RequestIdMiddleware is not wired onto the app at all. "
         "Did you call app.add_middleware(RequestIdMiddleware)?"
     )
-    assert names[-1] == "RequestIdMiddleware", (
+    assert names[0] == "RequestIdMiddleware", (
         "RequestIdMiddleware must be the outermost middleware (the LAST "
-        f"app.add_middleware call). Observed order (innermost->outermost): {names}. "
+        f"app.add_middleware call). Observed order (outermost->innermost): {names}. "
         "Expected MetricsMiddleware first, then StructuredLoggingMiddleware, "
         "then RequestIdMiddleware."
     )

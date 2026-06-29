@@ -1,80 +1,89 @@
-"""Toy FastAPI service for the Module 11 Core Skills Drill.
-
-Two endpoints (POST /echo, GET /sum) on an in-memory app. Your job:
-
-  1. Declare three Prometheus metrics at module scope (requests_total,
-     request_latency_seconds, inflight_requests).
-  2. Implement three ASGI middlewares (RequestId, StructuredLogging, Metrics)
-     and add them to the app in the correct order.
-  3. Mount /metrics via prometheus_client.make_asgi_app().
-
-The published Drill page is the canonical task list. The autograder verifies
-the metrics surface, header behavior, and a JSON log line is emitted.
-"""
-
-from fastapi import FastAPI
+import uuid
+import json
+import logging
+import time
+import contextvars
+from fastapi import FastAPI, Request
 from pydantic import BaseModel
+from prometheus_client import Counter, Histogram, Gauge, make_asgi_app
+from starlette.middleware.base import BaseHTTPMiddleware
 
-# TODO: import Counter, Gauge, Histogram, make_asgi_app from prometheus_client.
+# 1. Module-level declarations
+request_id_var = contextvars.ContextVar("request_id", default="")
+logger = logging.getLogger("app")
 
-# TODO: import uuid, json, logging, time, contextvars as you need them.
+# Declare Metrics
+requests_total = Counter(
+    "requests_total", "Total HTTP requests", ["path", "status"]
+)
+request_latency_seconds = Histogram(
+    "request_latency_seconds", "Request latency in seconds", ["path"],
+    buckets=[0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10]
+)
+inflight_requests = Gauge("inflight_requests", "In-flight requests")
 
+# 2. Middlewares
 
-# TODO: declare requests_total Counter (labels: path, status) at module scope.
-# TODO: declare request_latency_seconds Histogram at module scope.
-#       Labels: ["path"]. Use this explicit bucket sequence
-#       (do NOT use prometheus_client.Histogram's DEFAULT_BUCKETS --
-#       the published Drill guide pins these exact values):
-#         buckets=[0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10]
-# TODO: declare inflight_requests Gauge (no labels) at module scope.
+class RequestIdMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        req_id = uuid.uuid4().hex
+        token = request_id_var.set(req_id)
+        response = await call_next(request)
+        response.headers["X-Request-ID"] = req_id
+        request_id_var.reset(token)
+        return response
 
+class StructuredLoggingMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        start_time = time.perf_counter()
+        response = await call_next(request)
+        latency = (time.perf_counter() - start_time) * 1000
+        
+        log_data = {
+            "ts": time.time(),
+            "level": "INFO",
+            "request_id": request_id_var.get(),
+            "path": request.url.path,
+            "status": response.status_code,
+            "latency_ms": round(latency, 2)
+        }
+        logger.info(json.dumps(log_data))
+        return response
 
-# TODO: declare a module-level ContextVar named request_id_var (default "").
+class MetricsMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        inflight_requests.inc()
+        start_time = time.perf_counter()
+        try:
+            response = await call_next(request)
+            return response
+        finally:
+            elapsed = time.perf_counter() - start_time
+            requests_total.labels(path=request.url.path, status=str(response.status_code)).inc()
+            request_latency_seconds.labels(path=request.url.path).observe(elapsed)
+            inflight_requests.dec()
 
+# 3. FastAPI App Setup
+app = FastAPI(title="M11 Drill — Toy FastAPI Service")
 
-# TODO: implement RequestIdMiddleware.
-#   - On entry: generate uuid4().hex and store it in request_id_var.
-#   - On response: set the X-Request-ID header.
+# Add Middlewares (Last added is the outermost)
+app.add_middleware(MetricsMiddleware)
+app.add_middleware(StructuredLoggingMiddleware)
+app.add_middleware(RequestIdMiddleware)
 
+# Mount metrics endpoint
+app.mount("/metrics", make_asgi_app())
 
-# TODO: implement StructuredLoggingMiddleware.
-#   - Time the request.
-#   - Emit one JSON line at INFO level via the logging module with keys:
-#     ts, level, request_id, path, status, latency_ms.
-#   - Do NOT use print(...).
-
-
-# TODO: implement MetricsMiddleware.
-#   - On entry: increment inflight_requests.
-#   - Time the handler.
-#   - On exit (try/finally): decrement inflight_requests, increment
-#     requests_total.labels(path=..., status=...).inc(),
-#     call request_latency_seconds.labels(path=...).observe(elapsed).
-
+# ---------------------------------------------------------------------------
+# Endpoints
+# ---------------------------------------------------------------------------
 
 class EchoRequest(BaseModel):
     message: str
 
-
-app = FastAPI(title="M11 Drill — Toy FastAPI Service")
-
-
-# TODO: wire the three middlewares onto `app` in the correct order.
-#       Last add_middleware is outermost (request-id outer, metrics inner).
-
-
-# TODO: mount /metrics on `app` using make_asgi_app().
-
-
-# ---------------------------------------------------------------------------
-# Endpoints (do not modify — these are what the autograder hits with traffic).
-# ---------------------------------------------------------------------------
-
-
 @app.post("/echo")
 def echo(req: EchoRequest):
     return {"echo": req.message}
-
 
 @app.get("/sum")
 def sum_endpoint(a: int = 0, b: int = 0):
